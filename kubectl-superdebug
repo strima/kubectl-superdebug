@@ -6,6 +6,8 @@ target=""
 # Optional
 image="ubuntu:latest"
 namespace=""
+rootme="0"
+autoattach="0"
 proxy_port="8001"
 command="/bin/sh"
 verbose="--no-progress-meter -o /dev/null"  # make curl silent by default
@@ -19,12 +21,14 @@ The ephemeral container shares the PID namespace and volume attachments with the
 The ability to copy the volume attachments separates the functionality from that of kubectl debug.
 
 Options:
-    --pod/-p: The pod to attach the debug container to
-    --target/-t: The container to attach the debug container to
-    --namespace/-n: The namespace of the pod (default: current context namespace)
-    --image/-I: The image to use for the debug container (default: platform debug image or ubuntu:latest)
-    --command/-C: The command to run in the debug container (default: /bin/bash)
+    --pod/-p:        The pod to attach the debug container to
+    --target/-t:     The container to attach the debug container to
+    --namespace/-n:  The namespace of the pod (default: current context namespace)
+    --image/-I:      The image to use for the debug container (default: platform debug image or ubuntu:latest)
+    --command/-C:    The command to run in the debug container (default: /bin/bash)
     --proxy-port/-P: The port to use for kubectl proxy, used by this script in the backendd (default: 8001)
+    --root/-R:       The pod will be started with \"runAsNonRoot: false\" and \"runAsUser: 0\"
+    --attach/-A:     Automatically attach to the created debug container as soon as it is ready
 
 Images:
 You can specify a custom image for the debug container to use with the -I option.
@@ -59,6 +63,14 @@ while [[ $# -gt 0 ]]; do
     -C | --command)
         command="$2"
         shift 2
+        ;;
+    -R | --root)
+        rootme="1"
+        shift
+        ;;
+    -A | --attach)
+        autoattach="1"
+        shift
         ;;
     -v | --verbose)
         verbose="-v"
@@ -147,6 +159,12 @@ trap 'kill_kubectl_proxy' SIGINT SIGTERM EXIT
 echo "Waiting for proxy to come up..." 1>&2
 sleep 2
 
+patches_string_rootme="\"securityContext\": $(kubectl get pod ${pod} -n "${namespace}" -ojson | jq '.spec.containers[] | select(.name == "'"${target}"'").securityContext' -r),"
+if [ "$rootme" == "1" ] ; then
+	echo "Preping container to run as root"
+	patches_string_rootme='"securityContext": { "runAsNonRoot": false, "runAsUser": 0 },'
+fi
+
 patch=$(
     cat <<EOF
 {
@@ -159,6 +177,7 @@ patch=$(
             "command": ["${command}"],
             "stdin": true,
             "tty": true,
+    	    ${patches_string_rootme}
             "targetContainerName": "${target}"
         }]
     }
@@ -186,3 +205,27 @@ echo -e "\tkubectl -n ${namespace} attach ${pod} -i -t -c \"${container_name}\""
 echo
 echo You may disconnect from the debug container by pressing Ctrl-P followed by Ctrl-D.
 echo If you exit the shell, the debug container will be terminated.
+
+mywait=0
+attachready=0
+echo -n "Waiting for container to be ready to attach to: "
+while [ $mywait -lt 10 ] ; do
+	echo -n "."
+	attready=$(kubectl get pod "${pod}" -n "${namespace}" -ojson | jq '.status.ephemeralContainerStatuses[] | select(.name == "'"${container_name}"'").state.running' -r | sed 's/null//g' | tr -d '\n')
+	if [ "$attready" != "" ] ; then
+		attachready=1
+		break
+	fi
+	mywait=$(( mywait + 1 ))
+	sleep 1
+done
+echo ""
+
+if [ "$attachready" = "1" ] ; then
+	echo "Container is ready to attach to"
+	if [ "$autoattach" = "1" ] ; then
+		kubectl -n "${namespace}" attach "${pod}" -i -t -c "${container_name}"
+	fi
+else
+	echo "Container after 10 secs still not ready to attach to, please wait a bit more and then try the afore show kubectl attach command"
+fi
